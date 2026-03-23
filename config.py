@@ -36,7 +36,7 @@ RSI_OVERBOUGHT: int = 65             # RSI must be below this for long entries
 RSI_OVERSOLD: int = 35               # RSI must be above this for short entries
 RSI_BULL_MIN: int = 45               # RSI floor for long signal (momentum needed)
 RSI_BEAR_MAX: int = 55               # RSI ceiling for short signal
-MIN_SIGNAL_SCORE: float = 5.0        # minimum 7-point score to trigger signal
+MIN_SIGNAL_SCORE: float = 7.0        # minimum 10-point score to trigger signal
 
 # --- Session Weights -------------------------------------------------------
 SESSION_WEIGHTS: Dict[str, dict] = {
@@ -61,9 +61,15 @@ REQUIRE_CANDLE_PATTERN: bool = True   # require confirming candle pattern for en
 # --- Daily Loss Limit ------------------------------------------------------
 DAILY_LOSS_LIMIT_PCT: float = 3.0    # stop trading for the day after this % loss
 
-# --- Scaling Out -----------------------------------------------------------
+# --- Scaling Out / Multi-Target TP -----------------------------------------
 SCALE_OUT_AT_R: float = 1.0          # partial close when profit reaches this R
 SCALE_OUT_PCT: float = 0.5           # fraction of position to close
+TP_TARGETS: List[dict] = [
+    {"r_multiple": 1.0, "close_pct": 0.33},   # close 33% at 1R
+    {"r_multiple": 2.0, "close_pct": 0.33},   # close 33% at 2R
+    {"r_multiple": 3.0, "close_pct": 0.34},   # close remaining at 3R (runner)
+]
+USE_MULTI_TP: bool = False            # False = use single SCALE_OUT, True = use TP_TARGETS
 
 # --- News Calendar ---------------------------------------------------------
 NEWS_FILTER_ENABLED: bool = True
@@ -72,10 +78,20 @@ NEWS_CALENDAR_URL: str = "https://nfs.faireconomy.media/ff_calendar_thisweek.jso
 
 # --- Per-Symbol Exposure Cap -----------------------------------------------
 MAX_TRADES_PER_SYMBOL: int = 1       # max simultaneous positions per symbol
+SYMBOL_DAILY_LOSS_LIMIT_PCT: float = 1.5  # max daily loss per symbol (% of balance)
 
 # --- Equity Curve / Streak Tracking ----------------------------------------
 LOSING_STREAK_THRESHOLD: int = 3     # reduce size after N consecutive losses
 STREAK_RISK_REDUCTION: float = 0.5   # multiply risk by this during losing streak
+
+# --- Circuit Breaker -------------------------------------------------------
+MAX_CONSECUTIVE_LOSSES: int = 5      # pause all trading after N consecutive losses
+CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 4  # hours to pause after circuit breaker trips
+
+# --- Limit Orders ----------------------------------------------------------
+USE_LIMIT_ORDERS: bool = False        # True = use limit orders for moderate signals
+LIMIT_ORDER_SCORE_THRESHOLD: float = 8.0  # scores >= this use market, below use limit
+LIMIT_ORDER_EXPIRY_BARS: int = 6     # cancel pending order after N bars
 
 # --- Notifications ---------------------------------------------------------
 TELEGRAM_ENABLED: bool = False
@@ -88,6 +104,8 @@ DISCORD_WEBHOOK_URL: str = ""
 HEALTH_CHECK_INTERVAL: int = 3600    # seconds between health checks
 MAX_INACTIVE_CYCLES: int = 50        # warn if no signals in N cycles
 MAX_CONSECUTIVE_ERRORS: int = 5      # critical alert after N consecutive errors
+RECONNECT_MAX_RETRIES: int = 5       # max reconnection attempts
+RECONNECT_BASE_WAIT: int = 5         # base wait seconds for exponential backoff
 
 # --- Config Hot-Reload -----------------------------------------------------
 HOT_RELOAD_ENABLED: bool = True
@@ -104,6 +122,12 @@ LOG_FILE: str = "bot.log"
 TRADE_DB: str = "trades.db"
 LOG_LEVEL: str = "INFO"
 LOG_FORMAT: str = "text"              # "text" or "json"
+LOG_MAX_BYTES: int = 10 * 1024 * 1024  # 10 MB per log file
+LOG_BACKUP_COUNT: int = 5            # number of rotated log files to keep
 
 # --- Dashboard -------------------------------------------------------------
 DASHBOARD_STATE_FILE: str = "bot_state.json"
+
+# --- Backtester ------------------------------------------------------------
+BACKTEST_SPREAD_PIPS: float = 1.5    # simulated spread in pips
+BACKTEST_SLIPPAGE_PIPS: float = 0.5  # max random adverse slippage

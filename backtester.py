@@ -19,31 +19,14 @@ import pandas as pd
 import config
 import indicators
 import signals
-
-
-def _calculate_new_sl(
-    direction: str, open_price: float, current_sl: float,
-    current_price: float, atr: float, profit_r: float,
-) -> float:
-    """Pure SL calculation — duplicated here to avoid MT5 import chain."""
-    new_sl = current_sl
-    if profit_r >= config.TRAIL_TRIGGER_R:
-        trail_dist = atr * config.TRAIL_ATR_MULT
-        if direction == "BUY":
-            candidate = round(current_price - trail_dist, 5)
-            if candidate > current_sl:
-                new_sl = candidate
-        else:
-            candidate = round(current_price + trail_dist, 5)
-            if candidate < current_sl:
-                new_sl = candidate
-    elif profit_r >= config.BREAKEVEN_TRIGGER_R:
-        buffer = atr * 0.1
-        if direction == "BUY" and current_sl < open_price:
-            new_sl = round(open_price + buffer, 5)
-        elif direction == "SELL" and current_sl > open_price:
-            new_sl = round(open_price - buffer, 5)
-    return new_sl
+from risk_math import (
+    calculate_new_sl,
+    compute_calmar,
+    compute_expectancy,
+    compute_max_consecutive,
+    compute_sharpe,
+    compute_sortino,
+)
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +64,12 @@ class BacktestResult:
     avg_win_pips: float = 0.0
     avg_loss_pips: float = 0.0
     avg_rr: float = 0.0
+    expectancy: float = 0.0
+    sharpe: float = 0.0
+    sortino: float = 0.0
+    calmar: float = 0.0
+    max_consecutive_wins: int = 0
+    max_consecutive_losses: int = 0
     trades: List[BacktestTrade] = field(default_factory=list)
     equity_curve: List[float] = field(default_factory=list)
 
@@ -199,7 +188,7 @@ class BacktestEngine:
                 profit_r = (bar["close"] - trade.entry_price) / r_dist
                 # Simple ATR approximation for trailing
                 atr = (high - low)  # current bar range as ATR proxy
-                new_sl = _calculate_new_sl("BUY", trade.entry_price, trade.sl, bar["close"], atr, profit_r)
+                new_sl = calculate_new_sl("BUY", trade.entry_price, trade.sl, bar["close"], atr, profit_r)
                 if new_sl != trade.sl:
                     trade.sl = new_sl
 
@@ -215,7 +204,7 @@ class BacktestEngine:
             if r_dist > 0:
                 profit_r = (trade.entry_price - bar["close"]) / r_dist
                 atr = (high - low)
-                new_sl = _calculate_new_sl("SELL", trade.entry_price, trade.sl, bar["close"], atr, profit_r)
+                new_sl = calculate_new_sl("SELL", trade.entry_price, trade.sl, bar["close"], atr, profit_r)
                 if new_sl != trade.sl:
                     trade.sl = new_sl
 
@@ -290,6 +279,21 @@ class BacktestEngine:
         rr_values = [t.profit_r for t in self.trades if t.profit_r != 0]
         result.avg_rr = round(np.mean(rr_values), 2) if rr_values else 0
 
+        # Advanced stats from risk_math
+        result.expectancy = compute_expectancy(
+            result.win_rate, result.avg_win_pips, result.avg_loss_pips,
+        )
+
+        pip_returns = [t.profit_pips for t in self.trades]
+        result.sharpe = compute_sharpe(pip_returns)
+        result.sortino = compute_sortino(pip_returns)
+
+        total_return = result.total_pips
+        result.calmar = compute_calmar(total_return, result.max_drawdown_pips)
+
+        win_loss_seq = [t.profit_pips > 0 for t in self.trades]
+        result.max_consecutive_wins, result.max_consecutive_losses = compute_max_consecutive(win_loss_seq)
+
         return result
 
 
@@ -309,6 +313,12 @@ def print_report(result: BacktestResult) -> None:
     print(f"  Avg win:           {result.avg_win_pips} pips")
     print(f"  Avg loss:          {result.avg_loss_pips} pips")
     print(f"  Avg R:R achieved:  {result.avg_rr}")
+    print(f"  Expectancy:        {result.expectancy} pips/trade")
+    print(f"  Sharpe ratio:      {result.sharpe}")
+    print(f"  Sortino ratio:     {result.sortino}")
+    print(f"  Calmar ratio:      {result.calmar}")
+    print(f"  Max consec. wins:  {result.max_consecutive_wins}")
+    print(f"  Max consec. losses:{result.max_consecutive_losses}")
     print("=" * 60)
 
     if result.trades:

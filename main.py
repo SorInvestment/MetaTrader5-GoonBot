@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 
 import config
+import config_validator
 import config_watcher
 import logger as trade_logger
 import mt5_bridge as mt5b
@@ -21,6 +22,7 @@ import state
 from equity_tracker import get_adjusted_risk_pct
 from health import HealthMonitor
 from notifier import notify, notify_trade
+from risk_math import volatility_lot_scale
 
 log = logging.getLogger(__name__)
 
@@ -150,9 +152,11 @@ def run_cycle(dry_run: bool = False, health: HealthMonitor = None) -> None:
                      signal.raw_score, signal.weighted_score, signal.reasons)
             continue
 
-        # Calculate lot size with streak adjustment
+        # Calculate lot size with streak + volatility adjustment
         adjusted_risk = get_adjusted_risk_pct()
+        vol_scale = volatility_lot_scale(entry_ind.get("atr_percentile", 50.0))
         lot = mt5b.calculate_lot_size(symbol, signal.sl_pips, risk_pct=adjusted_risk)
+        lot = round(lot * vol_scale, 2)
 
         result = mt5b.execute_trade(
             symbol=symbol,
@@ -246,6 +250,7 @@ def main() -> None:
 
     trade_logger.setup_logging()
     trade_logger.init_db()
+    config_validator.validate()
     config_watcher.init()
 
     health = HealthMonitor()

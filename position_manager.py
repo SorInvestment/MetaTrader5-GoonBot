@@ -1,22 +1,27 @@
 """
-position_manager.py — Breakeven, trailing stop, risk guards.
+position_manager.py — Breakeven, trailing stop, scaling out, and risk guards.
 Uses mt5_bridge for all MT5 interactions.
 """
 import logging
+from typing import Set
 
 import config
+import logger as trade_logger
 import mt5_bridge as mt5b
+from correlation import check_correlated_exposure
+from notifier import notify, notify_trade
 
 log = logging.getLogger(__name__)
+
+# Track tickets that have already been scaled out (cleared on restart)
+_scaled_tickets: Set[int] = set()
 
 
 def already_open(symbol: str) -> bool:
     """Return True if there is already an open position for the symbol."""
     data = mt5b.get_positions()
-    for pos in data["positions"]:
-        if pos["symbol"] == symbol:
-            return True
-    return False
+    count = sum(1 for p in data["positions"] if p["symbol"] == symbol)
+    return count >= config.MAX_TRADES_PER_SYMBOL
 
 
 def drawdown_ok() -> bool:
@@ -35,6 +40,7 @@ def drawdown_ok() -> bool:
     dd_pct = (1 - equity / balance) * 100
     if dd_pct >= config.MAX_DRAWDOWN_PCT:
         log.warning("Drawdown guard triggered: %.2f%% >= %.2f%%", dd_pct, config.MAX_DRAWDOWN_PCT)
+        notify(f"Drawdown guard: {dd_pct:.2f}% >= {config.MAX_DRAWDOWN_PCT}%", level="warning")
         return False
     return True
 
@@ -62,8 +68,80 @@ def spread_ok(symbol: str) -> bool:
     return True
 
 
+def daily_loss_ok() -> bool:
+    """Return False if today's realised losses exceed the daily limit."""
+    acct = mt5b.get_account_info()
+    if "error" in acct:
+        return False
+
+    daily_pnl = trade_logger.get_daily_pnl()
+    limit = acct["balance"] * (config.DAILY_LOSS_LIMIT_PCT / 100.0)
+
+    if daily_pnl < 0 and abs(daily_pnl) >= limit:
+        log.warning("Daily loss limit hit: %.2f >= %.2f", abs(daily_pnl), limit)
+        notify(f"Daily loss limit: {abs(daily_pnl):.2f} >= {limit:.2f}", level="warning")
+        return False
+    return True
+
+
+def volatility_ok(ind: dict) -> bool:
+    """Return False if ATR percentile is outside acceptable range."""
+    pct = ind.get("atr_percentile", 50.0)
+    if pct < config.ATR_LOW_PERCENTILE:
+        log.info("Volatility too low: ATR percentile=%.1f < %.1f", pct, config.ATR_LOW_PERCENTILE)
+        return False
+    if pct > config.ATR_HIGH_PERCENTILE:
+        log.info("Volatility too high: ATR percentile=%.1f > %.1f", pct, config.ATR_HIGH_PERCENTILE)
+        return False
+    return True
+
+
+def correlation_ok(symbol: str, direction: str) -> bool:
+    """Return False if adding this trade would exceed correlated exposure limits."""
+    data = mt5b.get_positions()
+    return not check_correlated_exposure(data["positions"], symbol, direction)
+
+
+def calculate_new_sl(
+    direction: str,
+    open_price: float,
+    current_sl: float,
+    current_price: float,
+    atr: float,
+    profit_r: float,
+) -> float:
+    """
+    Pure function to calculate new SL based on breakeven and trailing logic.
+    Returns the new SL, or current_sl if no change needed.
+    Used by both live position manager and backtester.
+    """
+    new_sl = current_sl
+
+    # Trailing stop logic (higher priority — check first)
+    if profit_r >= config.TRAIL_TRIGGER_R:
+        trail_dist = atr * config.TRAIL_ATR_MULT
+        if direction == "BUY":
+            candidate = round(current_price - trail_dist, 5)
+            if candidate > current_sl:
+                new_sl = candidate
+        else:
+            candidate = round(current_price + trail_dist, 5)
+            if candidate < current_sl:
+                new_sl = candidate
+
+    # Breakeven logic (only if trail hasn't already moved SL)
+    elif profit_r >= config.BREAKEVEN_TRIGGER_R:
+        buffer = atr * 0.1
+        if direction == "BUY" and current_sl < open_price:
+            new_sl = round(open_price + buffer, 5)
+        elif direction == "SELL" and current_sl > open_price:
+            new_sl = round(open_price - buffer, 5)
+
+    return new_sl
+
+
 def manage_open_positions() -> None:
-    """Check all open positions for breakeven and trailing stop adjustments."""
+    """Check all open positions for scale-out, breakeven, and trailing stop adjustments."""
     data = mt5b.get_positions()
     if data["count"] == 0:
         return
@@ -75,6 +153,7 @@ def manage_open_positions() -> None:
         open_price = pos["open_price"]
         current_sl = pos["sl"]
         current_tp = pos["tp"]
+        volume = pos["volume"]
 
         # Skip positions without SL (not managed by us)
         if current_sl == 0:
@@ -104,38 +183,41 @@ def manage_open_positions() -> None:
             continue
 
         atr = ind["atr"]
-        new_sl = current_sl
 
-        # Trailing stop logic (check first — higher priority)
-        if current_profit_r >= config.TRAIL_TRIGGER_R:
-            trail_dist = atr * config.TRAIL_ATR_MULT
-            if direction == "BUY":
-                candidate = round(current_price - trail_dist, 5)
-                if candidate > current_sl:
-                    new_sl = candidate
-                    log.info("Trail BUY %s ticket=%s — new_sl=%.5f (profit=%.1fR)",
-                             symbol, ticket, new_sl, current_profit_r)
-            else:
-                candidate = round(current_price + trail_dist, 5)
-                if candidate < current_sl:
-                    new_sl = candidate
-                    log.info("Trail SELL %s ticket=%s — new_sl=%.5f (profit=%.1fR)",
-                             symbol, ticket, new_sl, current_profit_r)
+        # --- Scale out logic ---
+        if (
+            ticket not in _scaled_tickets
+            and current_profit_r >= config.SCALE_OUT_AT_R
+            and volume > 0.02  # need enough volume to split
+        ):
+            close_vol = round(volume * config.SCALE_OUT_PCT, 2)
+            if close_vol >= 0.01:
+                result = mt5b.partial_close(ticket, close_vol, "scale_out")
+                if result.get("success"):
+                    _scaled_tickets.add(ticket)
+                    remaining = result["remaining_volume"]
+                    trade_logger.log_partial_close(ticket, close_vol, remaining, 0.0)
+                    notify_trade("scale_out", symbol, direction, current_price,
+                                 current_sl, current_tp, lot_size=close_vol)
+                    log.info("Scaled out %s ticket=%s — closed %.2f, remaining %.2f",
+                             symbol, ticket, close_vol, remaining)
+                else:
+                    log.error("Scale out failed for ticket=%s: %s", ticket, result.get("error"))
 
-        # Breakeven logic (only if trail hasn't already moved SL)
-        elif current_profit_r >= config.BREAKEVEN_TRIGGER_R:
-            buffer = atr * 0.1
-            if direction == "BUY" and current_sl < open_price:
-                new_sl = round(open_price + buffer, 5)
-                log.info("Breakeven BUY %s ticket=%s — new_sl=%.5f",
-                         symbol, ticket, new_sl)
-            elif direction == "SELL" and current_sl > open_price:
-                new_sl = round(open_price - buffer, 5)
-                log.info("Breakeven SELL %s ticket=%s — new_sl=%.5f",
-                         symbol, ticket, new_sl)
+        # --- Breakeven and trailing stop ---
+        new_sl = calculate_new_sl(direction, open_price, current_sl, current_price, atr, current_profit_r)
 
-        # Apply modification if SL changed
         if new_sl != current_sl:
+            # Determine action type for logging
+            if current_profit_r >= config.TRAIL_TRIGGER_R and new_sl != current_sl:
+                action = "trail"
+            else:
+                action = "breakeven"
+
             result = mt5b.modify_sl_tp(ticket, new_sl, current_tp)
-            if not result["success"]:
+            if result["success"]:
+                log.info("%s %s %s ticket=%s — new_sl=%.5f (profit=%.1fR)",
+                         action.capitalize(), direction, symbol, ticket, new_sl, current_profit_r)
+                notify_trade(action, symbol, direction, current_price, new_sl, current_tp)
+            else:
                 log.error("Failed to modify SL for ticket=%s: %s", ticket, result["error"])

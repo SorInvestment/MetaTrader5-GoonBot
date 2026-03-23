@@ -102,9 +102,23 @@ def get_indicators(symbol: str, timeframe: str = "H1", count: int = 200) -> dict
 
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
-    df.rename(columns={"tick_volume": "tick_volume"}, inplace=True)
 
     return indicators.compute_indicators(df, symbol, timeframe)
+
+
+def get_candle_dataframe(symbol: str, timeframe: str = "H1", count: int = 10) -> pd.DataFrame:
+    """Fetch raw candle DataFrame for pattern detection."""
+    tf = TF_MAP.get(timeframe)
+    if tf is None:
+        return pd.DataFrame()
+
+    rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+    if rates is None or len(rates) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    return df
 
 
 def get_tick(symbol: str) -> dict:
@@ -310,6 +324,59 @@ def close_position(ticket: int, reason: str = "") -> dict:
 
     log.info("Position closed — ticket=%s  profit=%.2f  reason=%s", ticket, pos.profit, reason)
     return {"success": True, "ticket": ticket, "profit": round(pos.profit, 2)}
+
+
+def partial_close(ticket: int, volume: float, reason: str = "scale_out") -> dict:
+    """Partially close a position by sending a reverse order for the specified volume."""
+    positions = mt5.positions_get(ticket=ticket)
+    if positions is None or len(positions) == 0:
+        return {"success": False, "error": f"Position {ticket} not found"}
+
+    pos = positions[0]
+    symbol = pos.symbol
+    close_volume = round(min(volume, pos.volume), 2)
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return {"success": False, "error": f"No tick for {symbol}"}
+
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        close_type = mt5.ORDER_TYPE_SELL
+        price = tick.bid
+    else:
+        close_type = mt5.ORDER_TYPE_BUY
+        price = tick.ask
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": close_volume,
+        "type": close_type,
+        "position": ticket,
+        "price": price,
+        "deviation": 20,
+        "magic": MAGIC,
+        "comment": reason,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result is None:
+        return {"success": False, "error": f"Partial close None: {mt5.last_error()}"}
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return {"success": False, "error": f"Partial close failed: {result.comment}"}
+
+    remaining = round(pos.volume - close_volume, 2)
+    log.info("Partial close — ticket=%s closed=%.2f remaining=%.2f reason=%s",
+             ticket, close_volume, remaining, reason)
+    return {
+        "success": True,
+        "ticket": ticket,
+        "closed_volume": close_volume,
+        "remaining_volume": remaining,
+    }
 
 
 def modify_sl_tp(ticket: int, new_sl: float, new_tp: float) -> dict:

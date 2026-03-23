@@ -155,6 +155,16 @@ def compute_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> dict:
     atr_val = round(float(atr_series.iloc[-1]), 5)
     atr_pips = round(atr_val / 0.001, 2)
 
+    # ATR percentile (where current ATR sits relative to recent history)
+    lookback = min(len(atr_series.dropna()), 50)
+    if lookback > 1:
+        atr_window = atr_series.dropna().iloc[-lookback:]
+        atr_percentile = round(
+            float((atr_window < atr_val).sum() / len(atr_window) * 100), 1
+        )
+    else:
+        atr_percentile = 50.0
+
     # Support/Resistance
     recent_high = round(float(df["high"].iloc[-50:].max()), 5)
     recent_low = round(float(df["low"].iloc[-50:].min()), 5)
@@ -196,6 +206,7 @@ def compute_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> dict:
         },
         "atr": atr_val,
         "atr_pips": atr_pips,
+        "atr_percentile": atr_percentile,
         "support_resistance": {
             "recent_high": recent_high,
             "recent_low": recent_low,

@@ -3,3 +3,7 @@ __pycache__/
 *.pyo
 bot.log
 trades.db
+bot_state.json
+news_cache.json
+.pytest_cache/
+.mypy_cache/

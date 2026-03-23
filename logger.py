@@ -4,6 +4,7 @@ Supports both text and JSON log formats.
 """
 import json
 import logging
+import logging.handlers
 import sqlite3
 from datetime import datetime, date, timezone
 from typing import Dict, List, Optional
@@ -41,8 +42,12 @@ def setup_logging() -> None:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(logging.Formatter(text_fmt))
 
-    # File handler uses configured format
-    file_handler = logging.FileHandler(config.LOG_FILE)
+    # File handler with rotation
+    file_handler = logging.handlers.RotatingFileHandler(
+        config.LOG_FILE,
+        maxBytes=config.LOG_MAX_BYTES,
+        backupCount=config.LOG_BACKUP_COUNT,
+    )
     if getattr(config, "LOG_FORMAT", "text") == "json":
         file_handler.setFormatter(JSONFormatter())
     else:
@@ -55,8 +60,9 @@ def setup_logging() -> None:
 
 
 def init_db() -> None:
-    """Create trades table in SQLite if it does not exist."""
+    """Create trades table in SQLite if it does not exist. Enables WAL mode for concurrent access."""
     conn = sqlite3.connect(config.TRADE_DB)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS trades (
@@ -191,6 +197,19 @@ def get_daily_pnl() -> float:
     return float(row[0]) if row else 0.0
 
 
+def get_symbol_daily_pnl(symbol: str) -> float:
+    """Return total realised P&L for a specific symbol today (UTC)."""
+    today = date.today().isoformat()
+    conn = sqlite3.connect(config.TRADE_DB)
+    cur = conn.execute(
+        "SELECT COALESCE(SUM(profit), 0) FROM trades WHERE status='closed' AND symbol=? AND close_time LIKE ?",
+        (symbol, today + "%"),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return float(row[0]) if row else 0.0
+
+
 def get_recent_trades(n: int = 10) -> List[Dict]:
     """Fetch the last N closed trades ordered by close time."""
     conn = sqlite3.connect(config.TRADE_DB)
@@ -202,6 +221,15 @@ def get_recent_trades(n: int = 10) -> List[Dict]:
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
+
+
+def get_open_tickets() -> List[int]:
+    """Return all ticket numbers currently marked as open in the database."""
+    conn = sqlite3.connect(config.TRADE_DB)
+    cur = conn.execute("SELECT ticket FROM trades WHERE status='open'")
+    tickets = [row[0] for row in cur.fetchall()]
+    conn.close()
+    return tickets
 
 
 def get_streak() -> int:

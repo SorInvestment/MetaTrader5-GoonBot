@@ -209,10 +209,11 @@ class BacktestEngine:
                     trade.sl = new_sl
 
         # Update equity curve
+        pip_size = 0.01 if "JPY" in trade.symbol else 0.0001
         if trade.direction == "BUY":
-            unrealised = (bar["close"] - trade.entry_price) / 0.001
+            unrealised = (bar["close"] - trade.entry_price) / pip_size
         else:
-            unrealised = (trade.entry_price - bar["close"]) / 0.001
+            unrealised = (trade.entry_price - bar["close"]) / pip_size
         self.equity_curve.append(self.equity_curve[-1] + 0)  # flat until closed
 
     def _close_trade(self, exit_price: float, exit_time: datetime, reason: str) -> None:
@@ -222,10 +223,11 @@ class BacktestEngine:
         trade.exit_time = exit_time
         trade.exit_reason = reason
 
+        pip_size = 0.01 if "JPY" in trade.symbol else 0.0001
         if trade.direction == "BUY":
-            trade.profit_pips = round((exit_price - trade.entry_price) / 0.001, 1)
+            trade.profit_pips = round((exit_price - trade.entry_price) / pip_size, 1)
         else:
-            trade.profit_pips = round((trade.entry_price - exit_price) / 0.001, 1)
+            trade.profit_pips = round((trade.entry_price - exit_price) / pip_size, 1)
 
         r_dist = abs(trade.entry_price - trade.sl) if trade.sl != trade.entry_price else 1
         trade.profit_r = round(trade.profit_pips * 0.001 / r_dist, 2) if r_dist > 0 else 0

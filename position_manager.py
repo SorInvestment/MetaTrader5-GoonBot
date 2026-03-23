@@ -3,7 +3,7 @@ position_manager.py — Breakeven, trailing stop, scaling out, and risk guards.
 Uses mt5_bridge for all MT5 interactions.
 """
 import logging
-from typing import Set
+from typing import Dict, Set
 
 import config
 import logger as trade_logger
@@ -14,8 +14,9 @@ from risk_math import calculate_new_sl
 
 log = logging.getLogger(__name__)
 
-# Track tickets that have already been scaled out (cleared on restart)
+# Track tickets and which R-levels have been scaled out (cleared on restart)
 _scaled_tickets: Set[int] = set()
+_multi_tp_completed: Dict[int, Set[float]] = {}  # ticket -> set of completed R-multiples
 
 
 def already_open(symbol: str) -> bool:
@@ -85,6 +86,22 @@ def daily_loss_ok() -> bool:
     return True
 
 
+def symbol_daily_loss_ok(symbol: str) -> bool:
+    """Return False if today's realised losses for this symbol exceed the per-symbol limit."""
+    acct = mt5b.get_account_info()
+    if "error" in acct:
+        return False
+
+    symbol_pnl = trade_logger.get_symbol_daily_pnl(symbol)
+    limit = acct["balance"] * (config.SYMBOL_DAILY_LOSS_LIMIT_PCT / 100.0)
+
+    if symbol_pnl < 0 and abs(symbol_pnl) >= limit:
+        log.warning("Per-symbol daily loss limit hit for %s: %.2f >= %.2f",
+                     symbol, abs(symbol_pnl), limit)
+        return False
+    return True
+
+
 def volatility_ok(ind: dict) -> bool:
     """Return False if ATR percentile is outside acceptable range."""
     pct = ind.get("atr_percentile", 50.0)
@@ -101,6 +118,82 @@ def correlation_ok(symbol: str, direction: str) -> bool:
     """Return False if adding this trade would exceed correlated exposure limits."""
     data = mt5b.get_positions()
     return not check_correlated_exposure(data["positions"], symbol, direction)
+
+
+def reconcile_closed_trades() -> None:
+    """Detect positions closed outside the bot (SL/TP hit, manual close) and update the DB."""
+    db_open_tickets = trade_logger.get_open_tickets()
+    if not db_open_tickets:
+        return
+
+    mt5_positions = mt5b.get_positions()
+    mt5_tickets = {p["ticket"] for p in mt5_positions["positions"]}
+
+    for ticket in db_open_tickets:
+        if ticket not in mt5_tickets:
+            # Position no longer exists in MT5 — look up closed profit from history
+            profit = _get_closed_profit(ticket)
+            trade_logger.update_trade_close(ticket, profit)
+            log.info("Reconciled closed trade: ticket=%s profit=%.2f", ticket, profit)
+            notify(f"Trade closed (external): ticket={ticket} profit={profit:.2f}")
+
+
+def _get_closed_profit(ticket: int) -> float:
+    """Look up the profit of a closed position from MT5 deal history."""
+    try:
+        import MetaTrader5 as mt5
+        from datetime import datetime, timezone, timedelta
+        # Search the last 7 days of history
+        now = datetime.now(timezone.utc)
+        deals = mt5.history_deals_get(now - timedelta(days=7), now, position=ticket)
+        if deals:
+            return sum(d.profit + d.swap + d.commission for d in deals)
+    except Exception as e:
+        log.warning("Could not fetch deal history for ticket=%s: %s", ticket, e)
+    return 0.0
+
+
+def _handle_multi_tp_scaleout(
+    ticket: int, symbol: str, direction: str, volume: float,
+    current_profit_r: float, current_price: float, current_sl: float, current_tp: float,
+) -> None:
+    """Handle multi-target TP scale-out using config.TP_TARGETS."""
+    if ticket not in _multi_tp_completed:
+        _multi_tp_completed[ticket] = set()
+
+    completed = _multi_tp_completed[ticket]
+
+    for target in config.TP_TARGETS:
+        r_multiple = target["r_multiple"]
+        close_pct = target["close_pct"]
+
+        if r_multiple in completed:
+            continue
+
+        if current_profit_r < r_multiple:
+            continue
+
+        if volume <= 0.02:
+            break
+
+        close_vol = round(volume * close_pct, 2)
+        if close_vol < 0.01:
+            close_vol = 0.01
+
+        result = mt5b.partial_close(ticket, close_vol, f"tp_{r_multiple}R")
+        if result.get("success"):
+            completed.add(r_multiple)
+            remaining = result["remaining_volume"]
+            trade_logger.log_partial_close(ticket, close_vol, remaining, 0.0)
+            notify_trade("scale_out", symbol, direction, current_price,
+                         current_sl, current_tp, lot_size=close_vol)
+            log.info("Multi-TP scale out %s ticket=%s at %.1fR — closed %.2f, remaining %.2f",
+                     symbol, ticket, r_multiple, close_vol, remaining)
+            volume = remaining
+        else:
+            log.error("Multi-TP scale out failed for ticket=%s at %.1fR: %s",
+                      ticket, r_multiple, result.get("error"))
+            break
 
 
 def manage_open_positions() -> None:
@@ -148,24 +241,28 @@ def manage_open_positions() -> None:
         atr = ind["atr"]
 
         # --- Scale out logic ---
-        if (
-            ticket not in _scaled_tickets
-            and current_profit_r >= config.SCALE_OUT_AT_R
-            and volume > 0.02  # need enough volume to split
-        ):
-            close_vol = round(volume * config.SCALE_OUT_PCT, 2)
-            if close_vol >= 0.01:
-                result = mt5b.partial_close(ticket, close_vol, "scale_out")
-                if result.get("success"):
-                    _scaled_tickets.add(ticket)
-                    remaining = result["remaining_volume"]
-                    trade_logger.log_partial_close(ticket, close_vol, remaining, 0.0)
-                    notify_trade("scale_out", symbol, direction, current_price,
-                                 current_sl, current_tp, lot_size=close_vol)
-                    log.info("Scaled out %s ticket=%s — closed %.2f, remaining %.2f",
-                             symbol, ticket, close_vol, remaining)
-                else:
-                    log.error("Scale out failed for ticket=%s: %s", ticket, result.get("error"))
+        if config.USE_MULTI_TP:
+            _handle_multi_tp_scaleout(ticket, symbol, direction, volume,
+                                      current_profit_r, current_price, current_sl, current_tp)
+        else:
+            if (
+                ticket not in _scaled_tickets
+                and current_profit_r >= config.SCALE_OUT_AT_R
+                and volume > 0.02
+            ):
+                close_vol = round(volume * config.SCALE_OUT_PCT, 2)
+                if close_vol >= 0.01:
+                    result = mt5b.partial_close(ticket, close_vol, "scale_out")
+                    if result.get("success"):
+                        _scaled_tickets.add(ticket)
+                        remaining = result["remaining_volume"]
+                        trade_logger.log_partial_close(ticket, close_vol, remaining, 0.0)
+                        notify_trade("scale_out", symbol, direction, current_price,
+                                     current_sl, current_tp, lot_size=close_vol)
+                        log.info("Scaled out %s ticket=%s — closed %.2f, remaining %.2f",
+                                 symbol, ticket, close_vol, remaining)
+                    else:
+                        log.error("Scale out failed for ticket=%s: %s", ticket, result.get("error"))
 
         # --- Breakeven and trailing stop ---
         new_sl = calculate_new_sl(direction, open_price, current_sl, current_price, atr, current_profit_r)

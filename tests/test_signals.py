@@ -117,3 +117,26 @@ class TestEvaluate:
         )
         expected_rr = round(config.TP_ATR_MULTIPLIER / config.SL_ATR_MULTIPLIER, 2)
         assert signal.rr_ratio == expected_rr
+
+    @patch("signals.get_session_weight", return_value=1.0)
+    def test_jpy_pip_size(self, mock_weight, bullish_indicator_dict, bullish_trend_dict):
+        """JPY pairs should use 0.01 pip size for sl_pips calculation."""
+        signal = signals.evaluate(
+            "USDJPY", bullish_indicator_dict, bullish_trend_dict,
+            ask=150.500, bid=150.497,
+        )
+        atr = bullish_indicator_dict["atr"]
+        expected_sl_pips = round(atr * config.SL_ATR_MULTIPLIER / 0.01, 1)
+        assert signal.sl_pips == expected_sl_pips
+
+    @patch("signals.get_session_weight", return_value=1.0)
+    def test_non_jpy_pip_size(self, mock_weight, bullish_indicator_dict, bullish_trend_dict):
+        """Non-JPY pairs should use 0.0001 pip size."""
+        # Pretend it's EURUSD
+        signal = signals.evaluate(
+            "EURUSD", bullish_indicator_dict, bullish_trend_dict,
+            ask=1.10000, bid=1.09997,
+        )
+        atr = bullish_indicator_dict["atr"]
+        expected_sl_pips = round(atr * config.SL_ATR_MULTIPLIER / 0.0001, 1)
+        assert signal.sl_pips == expected_sl_pips

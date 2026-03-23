@@ -9,6 +9,7 @@ import logging
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Dict
 
 import config
 import config_validator
@@ -19,12 +20,34 @@ import news_filter
 import position_manager as pm
 import signals
 import state
-from equity_tracker import get_adjusted_risk_pct
+from equity_tracker import get_adjusted_risk_pct, circuit_breaker_active
 from health import HealthMonitor
 from notifier import notify, notify_trade
 from risk_math import volatility_lot_scale
 
 log = logging.getLogger(__name__)
+
+# Duplicate order protection: symbol -> timestamp of last order placed
+_recent_orders: Dict[str, float] = {}
+_ORDER_COOLDOWN_SECONDS = 300  # 5 minutes between orders on same symbol
+
+
+def _order_cooldown_active(symbol: str) -> bool:
+    """Return True if an order was recently placed for this symbol."""
+    last_time = _recent_orders.get(symbol)
+    if last_time is None:
+        return False
+    elapsed = time.time() - last_time
+    if elapsed < _ORDER_COOLDOWN_SECONDS:
+        log.info("Order cooldown active for %s — %.0fs remaining", symbol,
+                 _ORDER_COOLDOWN_SECONDS - elapsed)
+        return True
+    return False
+
+
+def _record_order(symbol: str) -> None:
+    """Record that an order was placed for duplicate protection."""
+    _recent_orders[symbol] = time.time()
 
 
 def is_trading_allowed() -> bool:
@@ -53,11 +76,19 @@ def run_cycle(dry_run: bool = False, health: HealthMonitor = None) -> None:
     # Hot-reload config if changed
     config_watcher.check_and_reload()
 
+    # Reconcile positions closed outside the bot (SL/TP hit, manual close)
+    pm.reconcile_closed_trades()
+
     # Always manage existing positions first
     pm.manage_open_positions()
 
     if not is_trading_allowed():
         log.info("Outside trading hours — skipping signal scan")
+        return
+
+    if circuit_breaker_active():
+        log.warning("Circuit breaker active — skipping signal scan")
+        notify("Circuit breaker active — trading paused", level="warning")
         return
 
     if not pm.drawdown_ok():
@@ -80,6 +111,14 @@ def run_cycle(dry_run: bool = False, health: HealthMonitor = None) -> None:
             continue
 
         if not pm.spread_ok(symbol):
+            continue
+
+        if not pm.symbol_daily_loss_ok(symbol):
+            log.info("%s — per-symbol daily loss limit reached, skipping", symbol)
+            continue
+
+        # Duplicate order cooldown
+        if _order_cooldown_active(symbol):
             continue
 
         # News calendar filter
@@ -158,14 +197,45 @@ def run_cycle(dry_run: bool = False, health: HealthMonitor = None) -> None:
         lot = mt5b.calculate_lot_size(symbol, signal.sl_pips, risk_pct=adjusted_risk)
         lot = round(lot * vol_scale, 2)
 
-        result = mt5b.execute_trade(
-            symbol=symbol,
-            direction=signal.direction,
-            lot_size=lot,
-            sl_price=signal.sl_price,
-            tp_price=signal.tp_price,
-            comment="rule_bot",
+        # Margin pre-check
+        margin_check = mt5b.check_margin(symbol, signal.direction, lot)
+        if not margin_check["ok"]:
+            log.warning("Insufficient margin for %s %s %.2f lots: %s (required=%.2f free=%.2f)",
+                        signal.direction, symbol, lot,
+                        margin_check.get("error", ""),
+                        margin_check.get("required_margin", 0),
+                        margin_check.get("free_margin", 0))
+            notify(f"Margin check failed: {symbol} {signal.direction} {lot} lots", level="warning")
+            continue
+
+        # Decide between market order and limit order
+        use_limit = (
+            config.USE_LIMIT_ORDERS
+            and signal.weighted_score < config.LIMIT_ORDER_SCORE_THRESHOLD
         )
+
+        if use_limit:
+            result = mt5b.place_limit_order(
+                symbol=symbol,
+                direction=signal.direction,
+                lot_size=lot,
+                limit_price=signal.entry_price,
+                sl_price=signal.sl_price,
+                tp_price=signal.tp_price,
+                expiry_bars=config.LIMIT_ORDER_EXPIRY_BARS,
+                comment=f"limit_score={signal.weighted_score:.1f}",
+            )
+            order_type = "limit"
+        else:
+            result = mt5b.execute_trade(
+                symbol=symbol,
+                direction=signal.direction,
+                lot_size=lot,
+                sl_price=signal.sl_price,
+                tp_price=signal.tp_price,
+                comment="rule_bot",
+            )
+            order_type = "market"
 
         if result["success"]:
             trade_logger.log_trade(
@@ -176,12 +246,13 @@ def run_cycle(dry_run: bool = False, health: HealthMonitor = None) -> None:
                 entry_price=result["price"],
                 sl=signal.sl_price,
                 tp=signal.tp_price,
-                comment=f"score={signal.raw_score:.1f}/{signal.weighted_score:.1f}",
+                comment=f"{order_type}_score={signal.raw_score:.1f}/{signal.weighted_score:.1f}",
             )
             notify_trade(
                 "open", symbol, signal.direction, result["price"],
                 signal.sl_price, signal.tp_price, lot_size=lot,
             )
+            _record_order(symbol)
             if health:
                 health.record_trade()
         else:
@@ -300,6 +371,11 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Keyboard interrupt — shutting down gracefully")
     finally:
+        # Final reconciliation before disconnect
+        try:
+            pm.reconcile_closed_trades()
+        except Exception as e:
+            log.warning("Shutdown reconciliation failed: %s", e)
         mt5b.disconnect()
         summary = trade_logger.get_trade_summary()
         notify("Bot stopped")

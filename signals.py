@@ -308,7 +308,9 @@ def evaluate(
         sl_price = round(bid + sl_dist, 5)
         tp_price = round(bid - tp_dist, 5)
 
-    sl_pips = round(sl_dist / 0.001, 1)
+    # JPY pairs use pip=0.01, others use pip=0.0001
+    pip_size = 0.01 if "JPY" in symbol else 0.0001
+    sl_pips = round(sl_dist / pip_size, 1)
 
     sig = Signal(
         symbol=symbol,

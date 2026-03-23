@@ -1,12 +1,14 @@
 """
 news_filter.py — Economic calendar integration.
 Fetches high-impact news events and pauses trading around them.
+Supports configurable cache duration (default 48h) and fetches both
+this week and next week calendars for full coverage.
 """
 import json
 import logging
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import config
@@ -15,7 +17,6 @@ log = logging.getLogger(__name__)
 
 # Cache file for calendar data
 _CACHE_FILE = "news_cache.json"
-_CACHE_MAX_AGE = 6 * 3600  # 6 hours
 
 # Map symbols to their constituent currencies
 _SYMBOL_CURRENCIES: Dict[str, List[str]] = {
@@ -25,52 +26,83 @@ _SYMBOL_CURRENCIES: Dict[str, List[str]] = {
     "EURUSD": ["EUR", "USD"],
     "GBPUSD": ["GBP", "USD"],
     "EURGBP": ["EUR", "GBP"],
+    "AUDUSD": ["AUD", "USD"],
+    "NZDUSD": ["NZD", "USD"],
+    "USDCAD": ["USD", "CAD"],
+    "USDCHF": ["USD", "CHF"],
 }
 
 
-def _fetch_calendar() -> List[dict]:
-    """Download economic calendar from Forex Factory JSON feed."""
+def _fetch_single_calendar(url: str) -> List[dict]:
+    """Download a single calendar feed."""
     try:
         import requests
-        resp = requests.get(config.NEWS_CALENDAR_URL, timeout=10)
+        resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        events = resp.json()
-
-        # Cache to disk
-        with open(_CACHE_FILE, "w") as f:
-            json.dump({"timestamp": time.time(), "events": events}, f)
-
-        log.info("News calendar fetched: %d events", len(events))
-        return events
+        return resp.json()
     except Exception as e:
-        log.error("Failed to fetch news calendar: %s", e)
+        log.warning("Failed to fetch calendar from %s: %s", url, e)
         return []
+
+
+def _fetch_calendar() -> List[dict]:
+    """Download economic calendar from Forex Factory JSON feeds (this week + next week)."""
+    this_week = _fetch_single_calendar(config.NEWS_CALENDAR_URL)
+    next_week = _fetch_single_calendar(config.NEWS_CALENDAR_NEXT_WEEK_URL)
+
+    events = this_week + next_week
+
+    # Deduplicate by (date, title, country)
+    seen = set()
+    unique_events = []
+    for e in events:
+        key = (e.get("date", ""), e.get("title", ""), e.get("country", ""))
+        if key not in seen:
+            seen.add(key)
+            unique_events.append(e)
+
+    # Cache to disk
+    try:
+        with open(_CACHE_FILE, "w") as f:
+            json.dump({"timestamp": time.time(), "events": unique_events}, f)
+    except OSError as e:
+        log.warning("Failed to write news cache: %s", e)
+
+    log.info("News calendar fetched: %d events (%d this week, %d next week)",
+             len(unique_events), len(this_week), len(next_week))
+    return unique_events
 
 
 def _load_cached_calendar() -> List[dict]:
     """Load calendar from cache if fresh enough, otherwise fetch."""
+    cache_max_age = getattr(config, "NEWS_CACHE_HOURS", 48) * 3600
+
     if os.path.exists(_CACHE_FILE):
         try:
             with open(_CACHE_FILE) as f:
                 data = json.load(f)
             age = time.time() - data.get("timestamp", 0)
-            if age < _CACHE_MAX_AGE:
+            if age < cache_max_age:
                 return data.get("events", [])
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, OSError):
             pass
 
     return _fetch_calendar()
 
 
-def is_news_window(symbol: str, buffer_minutes: Optional[int] = None) -> bool:
+def is_news_window(symbol: str, buffer_minutes: Optional[int] = None,
+                   post_buffer_minutes: Optional[int] = None) -> bool:
     """
     Check if a high-impact news event for the symbol's currencies
     is within the buffer window (before or after).
+
+    Uses separate pre-event and post-event buffer durations.
     """
     if not config.NEWS_FILTER_ENABLED:
         return False
 
-    buffer = buffer_minutes or config.NEWS_BUFFER_MINUTES
+    pre_buffer = buffer_minutes or config.NEWS_BUFFER_MINUTES
+    post_buffer = post_buffer_minutes or getattr(config, "NEWS_POST_BUFFER_MINUTES", 15)
     currencies = _SYMBOL_CURRENCIES.get(symbol, [])
     if not currencies:
         return False
@@ -99,12 +131,22 @@ def is_news_window(symbol: str, buffer_minutes: Optional[int] = None) -> bool:
         except (ValueError, AttributeError):
             continue
 
-        # Check if within buffer window
-        delta = abs((event_time - now).total_seconds()) / 60.0
-        if delta <= buffer:
+        # Check if within pre or post buffer window
+        delta_minutes = (event_time - now).total_seconds() / 60.0
+
+        # Event is in the future and within pre-buffer
+        if 0 <= delta_minutes <= pre_buffer:
             log.info(
-                "News filter: %s blocked — %s event '%s' in %.0f minutes",
-                symbol, event_currency, event.get("title", "unknown"), delta,
+                "News filter: %s blocked — %s event '%s' in %.0f minutes (pre-news)",
+                symbol, event_currency, event.get("title", "unknown"), delta_minutes,
+            )
+            return True
+
+        # Event already happened and within post-buffer
+        if -post_buffer <= delta_minutes < 0:
+            log.info(
+                "News filter: %s blocked — %s event '%s' was %.0f minutes ago (post-news)",
+                symbol, event_currency, event.get("title", "unknown"), abs(delta_minutes),
             )
             return True
 

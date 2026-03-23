@@ -1,6 +1,7 @@
 """
-test_main.py — Unit tests for time filters and main loop logic.
+test_main.py — Unit tests for time filters, circuit breaker, and duplicate order protection.
 """
+import time
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -51,3 +52,23 @@ class TestIsTradingAllowed:
         mock_dt.now.return_value = self._mock_time(1, 23)  # Tuesday 23:00
         mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
         assert main.is_trading_allowed() is False
+
+
+class TestOrderCooldown:
+    def setup_method(self):
+        main._recent_orders.clear()
+
+    def test_no_cooldown_initially(self):
+        assert main._order_cooldown_active("USDJPY") is False
+
+    def test_cooldown_after_record(self):
+        main._record_order("USDJPY")
+        assert main._order_cooldown_active("USDJPY") is True
+
+    def test_cooldown_per_symbol(self):
+        main._record_order("USDJPY")
+        assert main._order_cooldown_active("EURJPY") is False
+
+    def test_cooldown_expires(self):
+        main._recent_orders["USDJPY"] = time.time() - 400  # 6+ min ago
+        assert main._order_cooldown_active("USDJPY") is False

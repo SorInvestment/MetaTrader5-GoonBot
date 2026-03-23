@@ -205,13 +205,16 @@ def calculate_lot_size(symbol: str, sl_pips: float, risk_pct: Optional[float] = 
     risk_amount = balance * (risk_pct / 100.0)
     point = info.point
     tick_value = info.trade_tick_value
+    digits = info.digits
 
     if tick_value <= 0 or point <= 0 or sl_pips <= 0:
         log.warning("Invalid values for lot calc — tick_value=%.5f point=%.5f sl_pips=%.1f",
                      tick_value, point, sl_pips)
         return 0.01
 
-    pip_value = tick_value * (0.0001 / point)
+    # Derive pip size from digits: 3 or 2 digits = JPY pair (pip=0.01), else pip=0.0001
+    pip_size = 0.01 if digits <= 3 else 0.0001
+    pip_value = tick_value * (pip_size / point)
     if pip_value <= 0:
         log.warning("pip_value <= 0, defaulting to min lot")
         return 0.01
@@ -223,6 +226,34 @@ def calculate_lot_size(symbol: str, sl_pips: float, risk_pct: Optional[float] = 
     log.info("Lot calc: balance=%.2f risk=%.2f sl_pips=%.1f pip_val=%.4f -> %.2f lots",
              balance, risk_amount, sl_pips, pip_value, lot)
     return lot
+
+
+def check_margin(symbol: str, direction: str, lot_size: float) -> dict:
+    """Check if there is sufficient free margin for the proposed trade."""
+    order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return {"ok": False, "error": f"No tick for {symbol}"}
+
+    price = tick.ask if direction == "BUY" else tick.bid
+
+    margin = mt5.order_calc_margin(order_type, symbol, lot_size, price)
+    if margin is None:
+        return {"ok": False, "error": f"Cannot calc margin: {mt5.last_error()}"}
+
+    acct = mt5.account_info()
+    if acct is None:
+        return {"ok": False, "error": "No account info"}
+
+    free_margin = acct.margin_free
+    sufficient = free_margin >= margin * 1.1  # 10% buffer
+
+    return {
+        "ok": sufficient,
+        "required_margin": round(margin, 2),
+        "free_margin": round(free_margin, 2),
+    }
 
 
 def execute_trade(
@@ -278,6 +309,104 @@ def execute_trade(
         "sl": round(sl_price, 5),
         "tp": round(tp_price, 5),
     }
+
+
+def place_limit_order(
+    symbol: str,
+    direction: str,
+    lot_size: float,
+    limit_price: float,
+    sl_price: float,
+    tp_price: float,
+    expiry_bars: int = 6,
+    comment: str = "rule_bot_limit",
+) -> dict:
+    """Place a pending limit order."""
+    if direction == "BUY":
+        order_type = mt5.ORDER_TYPE_BUY_LIMIT
+    else:
+        order_type = mt5.ORDER_TYPE_SELL_LIMIT
+
+    request = {
+        "action": mt5.TRADE_ACTION_PENDING,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": order_type,
+        "price": round(limit_price, 5),
+        "sl": round(sl_price, 5),
+        "tp": round(tp_price, 5),
+        "deviation": 20,
+        "magic": MAGIC,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result is None:
+        return {"success": False, "error": f"Limit order_send None: {mt5.last_error()}"}
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return {"success": False, "error": f"Limit order failed: {result.comment}"}
+
+    log.info("Limit order placed — %s %s %.2f lots @ %.5f  SL=%.5f  TP=%.5f  ticket=%s",
+             direction, symbol, lot_size, limit_price, sl_price, tp_price, result.order)
+
+    return {
+        "success": True,
+        "ticket": result.order,
+        "price": round(limit_price, 5),
+        "lot_size": lot_size,
+        "sl": round(sl_price, 5),
+        "tp": round(tp_price, 5),
+    }
+
+
+def get_pending_orders(symbol: Optional[str] = None) -> dict:
+    """Get all pending orders, optionally filtered by symbol."""
+    if symbol:
+        orders = mt5.orders_get(symbol=symbol)
+    else:
+        orders = mt5.orders_get()
+
+    if orders is None:
+        return {"orders": [], "count": 0}
+
+    result = []
+    for o in orders:
+        if o.magic != MAGIC:
+            continue
+        result.append({
+            "ticket": o.ticket,
+            "symbol": o.symbol,
+            "type": o.type,
+            "volume": o.volume_current,
+            "price": round(o.price_open, 5),
+            "sl": round(o.sl, 5),
+            "tp": round(o.tp, 5),
+            "comment": o.comment,
+            "time_setup": datetime.fromtimestamp(o.time_setup, tz=timezone.utc).isoformat(),
+        })
+
+    return {"orders": result, "count": len(result)}
+
+
+def cancel_order(ticket: int) -> dict:
+    """Cancel a pending order."""
+    request = {
+        "action": mt5.TRADE_ACTION_REMOVE,
+        "order": ticket,
+    }
+
+    result = mt5.order_send(request)
+    if result is None:
+        return {"success": False, "error": f"Cancel returned None: {mt5.last_error()}"}
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return {"success": False, "error": f"Cancel failed: {result.comment}"}
+
+    log.info("Pending order cancelled — ticket=%s", ticket)
+    return {"success": True, "ticket": ticket}
 
 
 def close_position(ticket: int, reason: str = "") -> dict:

@@ -10,6 +10,7 @@ import logger as trade_logger
 import mt5_bridge as mt5b
 from correlation import check_correlated_exposure
 from notifier import notify, notify_trade
+from risk_math import calculate_new_sl
 
 log = logging.getLogger(__name__)
 
@@ -100,44 +101,6 @@ def correlation_ok(symbol: str, direction: str) -> bool:
     """Return False if adding this trade would exceed correlated exposure limits."""
     data = mt5b.get_positions()
     return not check_correlated_exposure(data["positions"], symbol, direction)
-
-
-def calculate_new_sl(
-    direction: str,
-    open_price: float,
-    current_sl: float,
-    current_price: float,
-    atr: float,
-    profit_r: float,
-) -> float:
-    """
-    Pure function to calculate new SL based on breakeven and trailing logic.
-    Returns the new SL, or current_sl if no change needed.
-    Used by both live position manager and backtester.
-    """
-    new_sl = current_sl
-
-    # Trailing stop logic (higher priority — check first)
-    if profit_r >= config.TRAIL_TRIGGER_R:
-        trail_dist = atr * config.TRAIL_ATR_MULT
-        if direction == "BUY":
-            candidate = round(current_price - trail_dist, 5)
-            if candidate > current_sl:
-                new_sl = candidate
-        else:
-            candidate = round(current_price + trail_dist, 5)
-            if candidate < current_sl:
-                new_sl = candidate
-
-    # Breakeven logic (only if trail hasn't already moved SL)
-    elif profit_r >= config.BREAKEVEN_TRIGGER_R:
-        buffer = atr * 0.1
-        if direction == "BUY" and current_sl < open_price:
-            new_sl = round(open_price + buffer, 5)
-        elif direction == "SELL" and current_sl > open_price:
-            new_sl = round(open_price - buffer, 5)
-
-    return new_sl
 
 
 def manage_open_positions() -> None:

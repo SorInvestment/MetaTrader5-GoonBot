@@ -64,20 +64,33 @@ class HealthMonitor:
         return False
 
     def check_connection(self, connect_fn: callable, disconnect_fn: callable) -> bool:
-        """Verify MT5 connection, attempt reconnect if needed."""
+        """Verify MT5 connection, attempt reconnect with exponential backoff."""
         try:
             import mt5_bridge as mt5b
             acct = mt5b.get_account_info()
-            if "error" in acct:
-                log.warning("MT5 connection lost, attempting reconnect...")
-                disconnect_fn()
+            if "error" not in acct:
+                return True
+
+            log.warning("MT5 connection lost, attempting reconnect with backoff...")
+            disconnect_fn()
+
+            max_retries = config.RECONNECT_MAX_RETRIES
+            base_wait = config.RECONNECT_BASE_WAIT
+
+            for attempt in range(1, max_retries + 1):
+                wait_time = base_wait * (2 ** (attempt - 1))
+                log.info("Reconnect attempt %d/%d (waiting %ds)...",
+                         attempt, max_retries, wait_time)
+                time.sleep(wait_time)
+
                 if connect_fn():
-                    log.info("MT5 reconnected successfully")
+                    log.info("MT5 reconnected on attempt %d", attempt)
                     return True
-                else:
-                    log.error("MT5 reconnection failed")
-                    return False
-            return True
+
+                log.warning("Reconnect attempt %d failed", attempt)
+
+            log.error("All %d reconnection attempts failed", max_retries)
+            return False
         except Exception as e:
             log.error("Health check connection error: %s", e)
             return False

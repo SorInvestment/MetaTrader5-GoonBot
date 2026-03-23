@@ -71,6 +71,26 @@ def validate():
     if config.MAX_OPEN_TRADES < 1:
         errors.append(f"MAX_OPEN_TRADES={config.MAX_OPEN_TRADES} must be >= 1")
 
+    # Circuit breaker
+    if config.MAX_CONSECUTIVE_LOSSES < 2:
+        warnings.append(f"MAX_CONSECUTIVE_LOSSES={config.MAX_CONSECUTIVE_LOSSES} very low, may pause too often")
+    if config.CIRCUIT_BREAKER_COOLDOWN_HOURS < 1:
+        warnings.append(f"CIRCUIT_BREAKER_COOLDOWN_HOURS={config.CIRCUIT_BREAKER_COOLDOWN_HOURS} very short")
+
+    # Per-symbol daily loss
+    if config.SYMBOL_DAILY_LOSS_LIMIT_PCT <= 0:
+        warnings.append(f"SYMBOL_DAILY_LOSS_LIMIT_PCT={config.SYMBOL_DAILY_LOSS_LIMIT_PCT} must be > 0")
+    if config.SYMBOL_DAILY_LOSS_LIMIT_PCT > config.DAILY_LOSS_LIMIT_PCT:
+        warnings.append(f"SYMBOL_DAILY_LOSS_LIMIT_PCT ({config.SYMBOL_DAILY_LOSS_LIMIT_PCT}) > DAILY_LOSS_LIMIT_PCT ({config.DAILY_LOSS_LIMIT_PCT})")
+
+    # News cache
+    if hasattr(config, "NEWS_CACHE_HOURS") and config.NEWS_CACHE_HOURS < 1:
+        warnings.append(f"NEWS_CACHE_HOURS={config.NEWS_CACHE_HOURS} too low, may cause excessive fetches")
+
+    # Limit orders
+    if config.USE_LIMIT_ORDERS and config.LIMIT_ORDER_SCORE_THRESHOLD <= config.MIN_SIGNAL_SCORE:
+        warnings.append(f"LIMIT_ORDER_SCORE_THRESHOLD ({config.LIMIT_ORDER_SCORE_THRESHOLD}) <= MIN_SIGNAL_SCORE ({config.MIN_SIGNAL_SCORE}) — all signals will use limits")
+
     # Loop interval
     if config.LOOP_INTERVAL_SECONDS < 10:
         warnings.append(f"LOOP_INTERVAL_SECONDS={config.LOOP_INTERVAL_SECONDS} very short, may cause rate limiting")

@@ -74,7 +74,10 @@ USE_MULTI_TP: bool = False            # False = use single SCALE_OUT, True = use
 # --- News Calendar ---------------------------------------------------------
 NEWS_FILTER_ENABLED: bool = True
 NEWS_BUFFER_MINUTES: int = 30        # pause trading N minutes before high-impact news
+NEWS_POST_BUFFER_MINUTES: int = 15   # pause trading N minutes after high-impact news
+NEWS_CACHE_HOURS: int = 48           # cache calendar data for this many hours
 NEWS_CALENDAR_URL: str = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_CALENDAR_NEXT_WEEK_URL: str = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
 
 # --- Per-Symbol Exposure Cap -----------------------------------------------
 MAX_TRADES_PER_SYMBOL: int = 1       # max simultaneous positions per symbol

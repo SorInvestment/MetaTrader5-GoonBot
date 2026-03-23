@@ -2,23 +2,25 @@
 test_position_manager.py — Unit tests for position management logic.
 """
 import pytest
+from unittest.mock import patch, MagicMock
 
 import config
 import position_manager as pm
+from risk_math import calculate_new_sl
 
 
 class TestCalculateNewSL:
     """Tests for the pure SL calculation function."""
 
     def test_no_change_below_breakeven(self):
-        new_sl = pm.calculate_new_sl(
+        new_sl = calculate_new_sl(
             direction="BUY", open_price=150.0, current_sl=149.5,
             current_price=150.3, atr=0.35, profit_r=0.6,
         )
         assert new_sl == 149.5  # No change — profit below breakeven trigger
 
     def test_breakeven_buy(self):
-        new_sl = pm.calculate_new_sl(
+        new_sl = calculate_new_sl(
             direction="BUY", open_price=150.0, current_sl=149.5,
             current_price=150.6, atr=0.35, profit_r=1.2,
         )
@@ -27,7 +29,7 @@ class TestCalculateNewSL:
         assert new_sl > 150.0  # SL moved above entry
 
     def test_breakeven_sell(self):
-        new_sl = pm.calculate_new_sl(
+        new_sl = calculate_new_sl(
             direction="SELL", open_price=150.0, current_sl=150.5,
             current_price=149.4, atr=0.35, profit_r=1.2,
         )
@@ -37,14 +39,14 @@ class TestCalculateNewSL:
 
     def test_no_breakeven_if_already_moved(self):
         # SL already at breakeven — should not change
-        new_sl = pm.calculate_new_sl(
+        new_sl = calculate_new_sl(
             direction="BUY", open_price=150.0, current_sl=150.05,
             current_price=150.6, atr=0.35, profit_r=1.2,
         )
         assert new_sl == 150.05  # No change — SL already above entry
 
     def test_trail_buy(self):
-        new_sl = pm.calculate_new_sl(
+        new_sl = calculate_new_sl(
             direction="BUY", open_price=150.0, current_sl=150.05,
             current_price=151.2, atr=0.35, profit_r=2.5,
         )
@@ -53,7 +55,7 @@ class TestCalculateNewSL:
         assert new_sl > 150.05
 
     def test_trail_sell(self):
-        new_sl = pm.calculate_new_sl(
+        new_sl = calculate_new_sl(
             direction="SELL", open_price=150.0, current_sl=149.95,
             current_price=148.8, atr=0.35, profit_r=2.5,
         )
@@ -63,7 +65,7 @@ class TestCalculateNewSL:
 
     def test_trail_does_not_move_sl_backward_buy(self):
         # Candidate trail SL is below current SL — should not move
-        new_sl = pm.calculate_new_sl(
+        new_sl = calculate_new_sl(
             direction="BUY", open_price=150.0, current_sl=150.9,
             current_price=151.0, atr=0.35, profit_r=2.1,
         )
@@ -83,3 +85,27 @@ class TestVolatilityOk:
     def test_high_volatility(self):
         ind = {"atr_percentile": 98.0}
         assert pm.volatility_ok(ind) is False
+
+
+class TestSymbolDailyLossOk:
+    @patch("position_manager.mt5b")
+    @patch("position_manager.trade_logger")
+    def test_ok_when_no_losses(self, mock_logger, mock_mt5b):
+        mock_mt5b.get_account_info.return_value = {"balance": 10000.0}
+        mock_logger.get_symbol_daily_pnl.return_value = 0.0
+        assert pm.symbol_daily_loss_ok("USDJPY") is True
+
+    @patch("position_manager.mt5b")
+    @patch("position_manager.trade_logger")
+    def test_blocked_when_limit_hit(self, mock_logger, mock_mt5b):
+        mock_mt5b.get_account_info.return_value = {"balance": 10000.0}
+        # SYMBOL_DAILY_LOSS_LIMIT_PCT = 1.5, so limit = 150
+        mock_logger.get_symbol_daily_pnl.return_value = -200.0
+        assert pm.symbol_daily_loss_ok("USDJPY") is False
+
+    @patch("position_manager.mt5b")
+    @patch("position_manager.trade_logger")
+    def test_ok_when_below_limit(self, mock_logger, mock_mt5b):
+        mock_mt5b.get_account_info.return_value = {"balance": 10000.0}
+        mock_logger.get_symbol_daily_pnl.return_value = -100.0  # below 150 limit
+        assert pm.symbol_daily_loss_ok("USDJPY") is True

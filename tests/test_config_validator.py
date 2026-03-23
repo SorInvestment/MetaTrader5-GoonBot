@@ -60,3 +60,15 @@ class TestConfigValidator:
         with patch.object(config, "MAX_DRAWDOWN_PCT", 60.0):
             with pytest.raises(ConfigError, match="MAX_DRAWDOWN_PCT"):
                 validate()
+
+    def test_circuit_breaker_low_warns(self):
+        """Low circuit breaker threshold should warn but not error."""
+        with patch.object(config, "MAX_CONSECUTIVE_LOSSES", 1):
+            # Should not raise — just warns
+            validate()
+
+    def test_symbol_daily_loss_greater_than_daily_warns(self):
+        """Per-symbol limit > daily limit should warn."""
+        with patch.object(config, "SYMBOL_DAILY_LOSS_LIMIT_PCT", 5.0), \
+             patch.object(config, "DAILY_LOSS_LIMIT_PCT", 3.0):
+            validate()  # Should not raise

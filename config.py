@@ -1,14 +1,16 @@
 """
 config.py — All user settings for the MT5 Rule-Based Trading Bot.
 Edit this file to configure the bot. No hardcoded values anywhere else.
+Credentials can be overridden via environment variables (recommended).
 """
+import os
 from typing import Dict, List, Optional
 
 # --- MT5 Connection --------------------------------------------------------
-MT5_LOGIN: int = 0                    # MT5 account number
-MT5_PASSWORD: str = ""                # MT5 password
-MT5_SERVER: str = ""                  # broker server, e.g. "ICMarkets-Live01"
-MT5_PATH: Optional[str] = None       # full path to terminal64.exe if needed
+MT5_LOGIN: int = int(os.environ.get("MT5_LOGIN", "5048716399"))
+MT5_PASSWORD: str = os.environ.get("MT5_PASSWORD", "S@MpHu4f")
+MT5_SERVER: str = os.environ.get("MT5_SERVER", "MetaQuotes-Demo")
+MT5_PATH: Optional[str] = os.environ.get("MT5_PATH", None)
 
 # --- Instruments -----------------------------------------------------------
 WATCHLIST: List[str] = ["USDJPY", "EURJPY", "GBPJPY"]

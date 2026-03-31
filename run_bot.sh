@@ -37,10 +37,15 @@ _is_running() {
 _bot_loop() {
     # Auto-restart loop — runs until explicitly stopped
     local extra_args="$*"
+    # Use launch_bot.py (simulated MT5) on Linux, main.py on Windows
+    local entry_script="$SCRIPT_DIR/launch_bot.py"
+    if python3 -c "import MetaTrader5" 2>/dev/null; then
+        entry_script="$SCRIPT_DIR/main.py"
+    fi
     while true; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting bot... $extra_args" >> "$LOG_FILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting bot via $(basename $entry_script)... $extra_args" >> "$LOG_FILE"
         # shellcheck disable=SC2086
-        "$PYTHON" "$SCRIPT_DIR/main.py" $extra_args >> "$LOG_FILE" 2>&1
+        "$PYTHON" "$entry_script" $extra_args >> "$LOG_FILE" 2>&1
         local exit_code=$?
 
         if [ $exit_code -eq 0 ]; then

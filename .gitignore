@@ -2,8 +2,11 @@ __pycache__/
 *.pyc
 *.pyo
 bot.log
+bot.log.*
 trades.db
 bot_state.json
 news_cache.json
+bot.pid
+.env
 .pytest_cache/
 .mypy_cache/
